@@ -1109,6 +1109,37 @@ static int test_pack_roundtrip(void)
     PMIX_DATA_BUFFER_DESTRUCT(&buf);
     PMIX_RELEASE(saved_map);
 
+    /* A rank a recoverable job has already lost stays in job->procs - the
+     * only record the master keeps of it - but recovering its resources
+     * drops it from every node->procs, so the maps no longer name it.  The
+     * packer used to send every rank in job->procs regardless, and the
+     * unpacker only ever creates a proc for a rank the maps name, so this
+     * rank arrived nowhere and the unpack failed outright
+     * (prte_dt_unpacking_fns.c: PRTE_ERR_NOT_FOUND). */
+    src->num_procs = 3;
+    proc = PMIX_NEW(prte_proc_t);
+    PMIX_LOAD_PROCID(&proc->name, "wire.job", 2);
+    proc->app_idx = 0;
+    proc->state = PRTE_PROC_STATE_TERM_WO_SYNC;
+    pmix_pointer_array_set_item(src->procs, 2, proc); // deliberately NOT in wnode->procs
+    dst = NULL;
+    PMIX_DATA_BUFFER_CONSTRUCT(&buf);
+    if (PRTE_SUCCESS == prte_job_pack(&buf, src, PRTE_JOB_PACK_ALL)) {
+        rc = prte_job_unpack(&buf, &dst, NULL);
+        CHECK("wire: a rank the maps no longer name does not block the rest",
+              PRTE_SUCCESS == rc && NULL != dst);
+        if (NULL != dst) {
+            CHECK("wire: num_procs still carries the lost rank", 3 == dst->num_procs);
+            proc = (prte_proc_t *) pmix_pointer_array_get_item(dst->procs, 0);
+            CHECK("wire: the mapped ranks still arrive",
+                  NULL != proc && PRTE_PROC_STATE_RUNNING == proc->state);
+            proc = (prte_proc_t *) pmix_pointer_array_get_item(dst->procs, 2);
+            CHECK("wire: the unmapped rank is simply absent", NULL == proc);
+            PMIX_RELEASE(dst);
+        }
+    }
+    PMIX_DATA_BUFFER_DESTRUCT(&buf);
+
     /* A proc the mapper left unranked sits on the node but not in the job's
      * rank-indexed procs array, so it has no proc record - yet the proc map
      * is built by walking the NODE.  Rendering its rank with a display

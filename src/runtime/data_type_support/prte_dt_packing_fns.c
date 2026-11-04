@@ -353,16 +353,69 @@ int prte_job_pack(pmix_data_buffer_t *bkt, prte_job_t *job, prte_job_pack_mode_t
             }
         }
 
-        /* ...and then what the maps cannot say, in rank order */
-        for (j = 0; j < job->procs->size; j++) {
-            if (NULL == (proc = (prte_proc_t *) pmix_pointer_array_get_item(job->procs, j))) {
-                continue;
+        /* ...and then what the maps cannot say, in rank order.
+         *
+         * Only for ranks the maps above name: prte_job_unpack creates a
+         * proc only for those (get_proc()), and a recoverable job keeps a
+         * lost rank's prte_proc_t in job->procs after it drops out of
+         * every node->procs. */
+        {
+            bool *mapped = (bool *) calloc(job->procs->size, sizeof(bool));
+            prte_node_t *mnode;
+            prte_proc_t *mproc;
+            int32_t nmapped;
+            int mn, mp;
+
+            if (NULL == mapped) {
+                PRTE_ERROR_LOG(PRTE_ERR_OUT_OF_RESOURCE);
+                return PRTE_ERR_OUT_OF_RESOURCE;
             }
-            rc = prte_proc_pack(bkt, proc, devices, mode);
-            if (PRTE_SUCCESS != rc) {
-                PRTE_ERROR_LOG(rc);
-                return rc;
+            for (mn = 0; mn < job->map->nodes->size; mn++) {
+                mnode = (prte_node_t *) pmix_pointer_array_get_item(job->map->nodes, mn);
+                if (NULL == mnode) {
+                    continue;
+                }
+                for (mp = 0; mp < mnode->procs->size; mp++) {
+                    mproc = (prte_proc_t *) pmix_pointer_array_get_item(mnode->procs, mp);
+                    /* a sentinel rank (PMIX_RANK_INVALID and friends) is a
+                     * huge unsigned value - compare unsigned, or it reads as
+                     * negative and slips under the bound it is meant to be
+                     * rejected by */
+                    if (NULL != mproc && PMIX_CHECK_NSPACE(job->nspace, mproc->name.nspace)
+                        && mproc->name.rank < (pmix_rank_t) job->procs->size) {
+                        mapped[mproc->name.rank] = true;
+                    }
+                }
             }
+            /* how many per-proc records follow - not a repeat of num_procs,
+             * which a lost rank legitimately falls short of, but a check
+             * that the receiver's own count of what the maps named (built
+             * while it unpacked them) agrees with what we computed here */
+            nmapped = 0;
+            for (j = 0; j < job->procs->size; j++) {
+                if (mapped[j] && NULL != pmix_pointer_array_get_item(job->procs, j)) {
+                    ++nmapped;
+                }
+            }
+            rc = PMIx_Data_pack(NULL, bkt, &nmapped, 1, PMIX_INT32);
+            if (PMIX_SUCCESS != rc) {
+                PMIX_ERROR_LOG(rc);
+                free(mapped);
+                return prte_pmix_convert_status(rc);
+            }
+            for (j = 0; j < job->procs->size; j++) {
+                if (!mapped[j]
+                    || NULL == (proc = (prte_proc_t *) pmix_pointer_array_get_item(job->procs, j))) {
+                    continue;
+                }
+                rc = prte_proc_pack(bkt, proc, devices, mode);
+                if (PRTE_SUCCESS != rc) {
+                    PRTE_ERROR_LOG(rc);
+                    free(mapped);
+                    return rc;
+                }
+            }
+            free(mapped);
         }
     }
 
