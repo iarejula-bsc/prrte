@@ -112,7 +112,7 @@ static int rank_cmp(const void *a, const void *b)
 static int unpack_layout(pmix_data_buffer_t *bkt, prte_job_t *jptr,
                          bool devices, prte_job_pack_mode_t mode)
 {
-    int32_t nnodes, n, cnt = 1;
+    int32_t nnodes, n, cnt = 1, nmapped, nfound = 0;
     int rc, a, i, j;
     char **nodenames = NULL, **fields = NULL, **ranks = NULL;
     prte_node_t **nodes = NULL, *nd;
@@ -252,19 +252,36 @@ static int unpack_layout(pmix_data_buffer_t *bkt, prte_job_t *jptr,
         applist = NULL;
     }
 
-    /* and now what the maps could not say, in rank order */
+    prc = PMIx_Data_unpack(NULL, bkt, &nmapped, &cnt, PMIX_INT32);
+    if (PMIX_SUCCESS != prc) {
+        PMIX_ERROR_LOG(prc);
+        rc = prte_pmix_convert_status(prc);
+        goto cleanup;
+    }
+
+    /* and now what the maps could not say, in rank order - only for the
+     * ranks the maps named above, which is what the packer sends (a
+     * recoverable job that lost ranks has fewer of them than num_procs) */
     for (j = 0; j < (int) jptr->num_procs; j++) {
         proc = (prte_proc_t *) pmix_pointer_array_get_item(jptr->procs, j);
         if (NULL == proc) {
-            PRTE_ERROR_LOG(PRTE_ERR_NOT_FOUND);
-            rc = PRTE_ERR_NOT_FOUND;
-            goto cleanup;
+            continue;
         }
+        ++nfound;
         rc = prte_proc_unpack(bkt, proc, devices, mode);
         if (PRTE_SUCCESS != rc) {
             PRTE_ERROR_LOG(rc);
             goto cleanup;
         }
+    }
+    /* the maps named exactly nmapped ranks when the packer counted them;
+     * the ranks they named here is the same count by construction, so a
+     * mismatch means the two computations disagree - a bug, not a proc
+     * this job merely lost */
+    if (nfound != nmapped) {
+        PRTE_ERROR_LOG(PRTE_ERR_BAD_PARAM);
+        rc = PRTE_ERR_BAD_PARAM;
+        goto cleanup;
     }
     rc = PRTE_SUCCESS;
 
