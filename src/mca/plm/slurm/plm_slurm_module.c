@@ -159,7 +159,8 @@ static void clear_parent_slurm_allocation_env(void)
  * destroyed the session for that job ID, so the launcher termination is
  * expected. If the session remains but only the HNP node survives, the shrink
  * removed every daemon task launched by this srun step while leaving the
- * controlling node alive.
+ * controlling node alive. A node whose daemon was lost (DOWN) counts as gone:
+ * the step ends once all its daemons are, and the DVM survived each loss.
  */
 static bool srun_exit_expected(uint32_t job_id)
 {
@@ -182,7 +183,7 @@ static bool srun_exit_expected(uint32_t job_id)
 
     for (int i = 0; i < session->nodes->size; i++) {
         node = (prte_node_t *) pmix_pointer_array_get_item(session->nodes, i);
-        if (NULL == node) {
+        if (NULL == node || PRTE_NODE_STATE_DOWN == node->state) {
             continue;
         }
         remaining = node;
@@ -190,6 +191,11 @@ static bool srun_exit_expected(uint32_t job_id)
         if (1 < count) {
             return false;
         }
+    }
+
+    /* every node of the step lost its daemon */
+    if (0 == count) {
+        return true;
     }
 
     if (1 != count || NULL == remaining) {

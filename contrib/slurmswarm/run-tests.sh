@@ -983,7 +983,7 @@ drop_extra_jobs() {   # $1 = the job id to keep
 # answer to it.  It runs on its own allocation and its own DVM so that either
 # outcome is harmless to everything else.
 elastic_external_cancel_group() {
-    local out aj anodes jid n
+    local out aj anodes jid n live
 
     banner "ras/slurm: an absorbed allocation cancelled behind the DVM's back"
     cleanup_cluster
@@ -1011,6 +1011,11 @@ elastic_external_cancel_group() {
         && ok "the DVM absorbed job $aj and has daemons on $anodes" \
         || bad "the absorbed allocation never got its daemons ($n on $anodes)"
 
+    # A tool stays connected through it: a DVM that carries on reports to
+    # its tools, not on its own stderr.
+    SA_BG /tmp/cancel-tool.out 'prun --host node1:1 -n 1 sleep 40'
+    sleep 3
+
     # The scheduler takes it back.  Not through PRRTE - this is a user, or an
     # admin, or a job's time limit, doing what any of them may legitimately do.
     SQ "scancel $aj" >/dev/null 2>&1
@@ -1021,18 +1026,34 @@ elastic_external_cancel_group() {
         && ok "the cancelled allocation's daemons are gone" \
         || bad "a daemon survived the cancellation of job $aj"
 
-    # Either form counts as having reported it.  show_help aggregates by
-    # topic, so whether the full node-died text or the one-line summary
-    # naming that topic reaches the user depends on what else was printed
-    # first -- and the oob layer's own "unable to complete a TCP connection"
-    # usually wins the race.  Both say the loss was noticed and announced,
-    # which is the property under test; which one is displayed is not.
-    SA 'grep -qE "lost communication with a remote daemon|help-errmgr-base.txt / node-died" /tmp/prte.out' \
+    # Either form counts as having reported it, on either stream.  show_help
+    # aggregates by topic, so whether the full node-died text or the one-line
+    # summary naming that topic reaches the user depends on what else was
+    # printed first -- and the oob layer's own "unable to complete a TCP
+    # connection" usually wins the race.  Both say the loss was noticed and
+    # announced, which is the property under test; which one is displayed is
+    # not.
+    SA 'tr -d "\\000" < /tmp/cancel-tool.out | cat - /tmp/prte.out |
+        grep -qE "lost communication with a remote daemon|help-errmgr-base.txt / node-died"' \
         && ok "the HNP reported the loss rather than waiting on it" \
         || bad "the HNP never reported losing the cancelled allocation's daemons"
 
+    # The DVM may carry on without the lost daemons, or end.  If it carries
+    # on, the loss has to be on record: one proc per node lands on the DVM's
+    # own nodes only.
+    live=""
+    if SA 'pgrep -x prte' >/dev/null 2>&1; then
+        live=$(job_nodes "$jid")
+        out=$(SA 'timeout 60 prun --map-by ppr:1:node hostname' 2>&1 | grep -E '^node[0-9]+$' | sort -V | paste -sd, -)
+        [ "$out" = "$live" ] \
+            && ok "the DVM carried on, mapping onto its own nodes only ($out)" \
+            || bad "the DVM carried on, but a proc per node ran on: $out"
+    fi
+
+    # a daemon of a DVM that carried on is not an orphan
     n=0
     for i in 1 2 3 4 5 6 7 8 9 10; do
+        echo ",$live," | grep -q ",node$i," && continue
         [ "$(prted_count $i)" = 1 ] && n=$((n+1))
     done
     [ "$n" = 0 ] \
@@ -1178,6 +1199,70 @@ elastic_regrant_order_group() {
     cleanup_cluster
 }
 
+# Wait for the srun of SLURM job $1 to end, after its daemons were killed:
+# prints "expected", or "the DVM ended", or nothing if neither happened.
+# srun-failed is not in /tmp/prte.out: show_help sends it to the tools.
+wait_srun_exit() {
+    for _ in $(seq 60); do
+        SA "grep -q 'srun for elastic job $1 exited' /tmp/prte.out" && { echo expected; return; }
+        SA 'pgrep -x prte' >/dev/null 2>&1 || { echo "the DVM ended"; return; }
+        sleep 1
+    done
+}
+
+# --no-kill makes losing one daemon cost one daemon, not the whole srun step.
+# Losing every daemon of a step ends its srun, and that end reports losses the
+# DVM has already survived: it must not be read as a failed launch.  Both
+# kinds of step: the one that started the DVM, whose node set includes the
+# HNP's, and the one an extend starts on its own allocation.
+#
+# Own DVM: it needs plm_base_verbose 1, and loses daemons on purpose.
+elastic_daemon_loss_group() {
+    local out jid ajid anode
+
+    banner "plm/slurm: losing every daemon of an srun step does not take the DVM down"
+    cleanup_cluster
+    ALLOC new --tag dvm --nodelist node1,node2 --tasks-per-node 2 >/dev/null 2>&1
+    jid=$(ALLOC jobid --tag dvm | tr -d ' \r')
+    if ! dvm_start --prtemca prte_elastic_mode 1 --prtemca plm_base_verbose 1; then
+        bad "no DVM came up for the daemon-loss case"
+        cleanup_cluster
+        return
+    fi
+
+    ON 2 'pkill -9 -x prted' >/dev/null 2>&1
+    out=$(wait_srun_exit "$jid")
+    [ "$out" = expected ] \
+        && ok "the DVM's own srun ended after losing node2's daemon, as expected" \
+        || bad "the end of the DVM's own srun after losing node2: ${out:-never seen}"
+    out=$(SA 'timeout 30 prun -n 1 hostname' 2>&1 | tail -1 | tr -d '\r')
+    [ "$out" = node1 ] \
+        && ok "...and the DVM still runs a job" \
+        || bad "the DVM did not survive losing node2's daemon: $out"
+
+    out=$(SA 'timeout 180 elastic extend 1' 2>&1)
+    ajid=$(echo "$out" | sed -n 's/^>>> ALLOC_ID \([0-9][0-9]*\).*/\1/p' | head -1)
+    if [ -z "$ajid" ] || ! echo "$out" | grep -q PMIX_DVM_IS_READY; then
+        skp "the extend did not complete -- no grown step to lose"
+        dvm_stop; cleanup_cluster
+        return
+    fi
+    anode=$(job_nodes "$ajid")
+    # shellcheck disable=SC2046
+    ON $(idx_of "$anode") 'pkill -9 -x prted' >/dev/null 2>&1
+    out=$(wait_srun_exit "$ajid")
+    [ "$out" = expected ] \
+        && ok "the extend's srun ended after losing $anode's daemon, as expected" \
+        || bad "the end of the extend's srun after losing $anode: ${out:-never seen}"
+    out=$(SA 'timeout 30 prun -n 1 hostname' 2>&1 | tail -1 | tr -d '\r')
+    [ "$out" = node1 ] \
+        && ok "...and the DVM still runs a job" \
+        || bad "the DVM did not survive losing $anode's daemon: $out"
+
+    dvm_stop
+    cleanup_cluster
+}
+
 # THE PHASE IS A SEQUENCE OF INDEPENDENT GROUPS, AND THAT IS DELIBERATE.
 #
 # Each group below is its own function so that a group which cannot proceed
@@ -1221,6 +1306,7 @@ test_elastic() {
     dvm_stop
     elastic_external_cancel_group
     elastic_regrant_order_group
+    elastic_daemon_loss_group
     cleanup_cluster
 
     # The last two groups need the recording shim in front of the real SLURM
