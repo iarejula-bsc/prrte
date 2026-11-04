@@ -460,6 +460,10 @@ static void proc_errors(int fd, short args, void *cbdata)
             PRTE_FLAG_UNSET(pptr, PRTE_PROC_FLAG_ALIVE);
             /* update the state */
             pptr->state = state;
+            /* ...and its node, until a daemon reports from it again */
+            if (NULL != pptr->node) {
+                pptr->node->state = PRTE_NODE_STATE_DOWN;
+            }
             /* adjust our num_procs */
             --prte_process_info.num_daemons;
             /* if this daemon was the target of an in-progress grow campaign,
